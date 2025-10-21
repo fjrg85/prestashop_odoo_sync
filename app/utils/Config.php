@@ -6,7 +6,7 @@ class Config
     /**
      * Helper genérico para obtener variables de entorno con normalización
      */
-    public static function get(string $key, mixed $default = null): mixed
+    public static function get(string $key, string|int|null $default = null): mixed
     {
         $value = $_ENV[$key] ?? getenv($key);
         if ($value === false || $value === null) {

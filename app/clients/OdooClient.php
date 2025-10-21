@@ -1,317 +1,363 @@
 <?php
+
 namespace App\Clients;
 
-use App\Utils\Config;
-use App\Utils\Logger;
 use PhpXmlRpc\Client as XmlRpcClient;
 use PhpXmlRpc\Request as XmlRpcRequest;
 use PhpXmlRpc\Value;
+use Psr\Log\LoggerInterface;
 
 class OdooClient
 {
-    private string $baseUrl;
+    private string $url;
     private string $db;
-    private string $user;
-    private string $pass;
+    private string $username;
+    private string $password;
     private ?int $uid = null;
-    private int $timeout;
-    private ?string $requestId = null;
+    private LoggerInterface $logger;
+    private string $requestId;
 
     public function __construct(
-        string $baseUrl = '',
-        string $db = '',
-        string $user = '',
-        string $pass = '',
-        int $timeout = 30
+        string $url,
+        string $db,
+        string $username,
+        string $password,
+        LoggerInterface $logger,
+        string $requestId = ''
     ) {
-        $this->baseUrl = rtrim($baseUrl ?: (string)Config::get('ODOO_BASE_URL', ''), '/');
-        $this->db      = $db ?: (string)Config::get('ODOO_DB', '');
-        $this->user    = $user ?: (string)Config::get('ODOO_USER', '');
-        $this->pass    = $pass ?: (string)Config::get('ODOO_PASS', '');
-        $this->timeout = (int)Config::get('ODOO_TIMEOUT', $timeout);
+        $this->url = rtrim($url, '/');
+        $this->db = $db;
+        $this->username = $username;
+        $this->password = $password;
+        $this->logger = $logger;
+        $this->requestId = $requestId ?: uniqid('req_', true);
     }
 
-    public function setRequestId(string $id): void
+    public function authenticate(): void
     {
-        $this->requestId = $id;
-    }
-
-    private function makeClient(string $url): XmlRpcClient
-    {
-        $client = new XmlRpcClient($url);
-        if (method_exists($client, 'SetCurlOptions')) {
-            $client->SetCurlOptions([
-                CURLOPT_CONNECTTIMEOUT => $this->timeout,
-                CURLOPT_TIMEOUT        => $this->timeout
-            ]);
-        }
-        if (method_exists($client, 'setDebug')) {
-            $client->setDebug(false);
-        }
-        return $client;
-    }
-
-    private function ensureAuth(): void
-    {
-        if ($this->uid !== null) return;
-
-        $client = $this->makeClient($this->baseUrl . '/xmlrpc/2/common');
-
-        $req = new XmlRpcRequest('authenticate', [
-            new Value($this->db, 'string'),
-            new Value($this->user, 'string'),
-            new Value($this->pass, 'string'),
-            new Value([
-                'platform' => new Value('PHP', 'string'),
-                'version'  => new Value(PHP_VERSION, 'string')
-            ], 'struct')
+        $this->logger->info("[OdooClient] Authenticating...", [
+            'requestId' => $this->requestId,
+            'url' => $this->url,
+            'db' => $this->db,
+            'username' => $this->username
         ]);
 
-        $resp = $client->send($req);
+        $client = new XmlRpcClient($this->url . '/xmlrpc/2/common');
+        $client->setSSLVerifyPeer(false);
+        $client->setSSLVerifyHost(0);
 
-        if ($resp->faultCode()) {
-            Logger::error("Odoo auth fault: " . $resp->faultString(), ['flow'=>'odoo','requestId'=>$this->requestId ?? '-']);
-            throw new \RuntimeException("Odoo auth fault: " . $resp->faultString());
-        }
-
-        $uid = $this->phpize($resp->value());
-        if (!is_numeric($uid)) {
-            Logger::error("Odoo auth unexpected response", ['flow'=>'odoo','requestId'=>$this->requestId ?? '-']);
-            throw new \RuntimeException("Odoo auth unexpected response");
-        }
-
-        $this->uid = (int)$uid;
-        Logger::info("Odoo authenticated", ['flow'=>'odoo','requestId'=>$this->requestId ?? '-','uid'=>$this->uid]);
-    }
-
-    private function execute_kw(string $model, string $method, array $params = [], array $kwargs = [])
-    {
-        $this->ensureAuth();
-        $client = $this->makeClient($this->baseUrl . '/xmlrpc/2/object');
-
-        $callParams = [
+        $msg = new XmlRpcRequest('authenticate', [
             new Value($this->db, 'string'),
-            new Value($this->uid, 'int'),
-            new Value($this->pass, 'string'),
-            new Value($model, 'string'),
-            new Value($method, 'string'),
-            $this->buildXmlRpcValue($params)
-        ];
+            new Value($this->username, 'string'),
+            new Value($this->password, 'string'),
+            new Value([], 'struct')
+        ]);
 
-        if (!empty($kwargs)) {
-            $callParams[] = $this->buildXmlRpcValue($kwargs);
+        $response = $client->send($msg);
+        
+        if ($response->faultCode()) {
+            $error = "Authentication failed: " . $response->faultString();
+            $this->logger->error("[OdooClient] $error", ['requestId' => $this->requestId]);
+            throw new \RuntimeException($error);
         }
 
-        $req = new XmlRpcRequest('execute_kw', $callParams);
-        $resp = $client->send($req);
-
-        if ($resp->faultCode()) {
-            Logger::error("Odoo execute fault: " . $resp->faultString(), [
-                'flow'=>'odoo','requestId'=>$this->requestId ?? '-','model'=>$model,'method'=>$method
-            ]);
-            throw new \RuntimeException("Odoo execute fault: " . $resp->faultString());
-        }
-
-        return $this->phpize($resp->value());
+        $this->uid = $response->value()->scalarval();
+        $this->logger->info("[OdooClient] Authenticated successfully", [
+            'requestId' => $this->requestId,
+            'uid' => $this->uid
+        ]);
     }
 
-    private function buildXmlRpcValue(mixed $data): Value
-    {
-        if (is_array($data)) {
-            $isAssoc = array_keys($data) !== range(0, count($data) - 1);
-
-            if ($isAssoc) {
-                $converted = [];
-                foreach ($data as $key => $val) {
-                    $converted[$key] = $this->buildXmlRpcValue($val);
-                }
-                return new Value($converted, 'struct');
-            } else {
-                $converted = array_map([$this, 'buildXmlRpcValue'], $data);
-                return new Value($converted, 'array');
-            }
-        }
-
-        if (is_bool($data)) return new Value($data, 'boolean');
-        if (is_int($data))  return new Value($data, 'int');
-        if (is_float($data))return new Value($data, 'double');
-
-        if (is_string($data) && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/', $data)) {
-            $dt = new \DateTime($data);
-            return new Value($dt->format('Ymd\THis'), 'datetime');
-        }
-
-        return new Value((string)$data, 'string');
-    }
-    private function phpize(mixed $value): mixed
-    {
-        if (is_object($value) && method_exists($value, 'kindOf')) {
-            switch ($value->kindOf()) {
-                case 'int':
-                case 'i4':
-                case 'double':
-                    return $value->scalarval();
-                case 'boolean':
-                    return (bool)$value->scalarval();
-                case 'string':
-                    return (string)$value->scalarval();
-                case 'array':
-                case 'struct':
-                    $out = [];
-                    if (isset($value->me['val']) && is_array($value->me['val'])) {
-                        foreach ($value->me['val'] as $item) {
-                            $child = $this->phpize($item['val']);
-                            if (isset($item['name'])) {
-                                $out[$item['name']] = $child;
-                            } else {
-                                $out[] = $child;
-                            }
-                        }
-                    }
-                    return $out;
-                default:
-                    return $value->scalarval();
-            }
-        }
-
-        if (is_array($value)) {
-            return array_map(fn($v) => $this->phpize($v), $value);
-        }
-
-        return $value;
-    }
-
+    /**
+     * Fetch products modified since a given date
+     * 
+     * @param string|null $since Date in ISO format (e.g., "2025-01-15 10:30:00")
+     * @return array Array of items with SKU, quantity and price
+     */
     public function fetchProducts(?string $since = null): array
     {
-        try {
-            Logger::debug("Entrando a fetchProducts", [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
+        $startTime = microtime(true);
+        
+        $this->logger->info("[fetchProducts] === INICIO DE EJECUCIÓN ===", [
+            'requestId' => $this->requestId,
+            'since' => $since,
+            'uid' => $this->uid,
+            'timestamp' => date('Y-m-d H:i:s')
+        ]);
+
+        if (!$this->uid) {
+            $this->logger->error("[fetchProducts] Not authenticated. Call authenticate() first", [
+                'requestId' => $this->requestId
             ]);
-
-            $originalSince = $since;
-
-            if ($since) {
-                $dt = new \DateTime($since);
-                $dt->setTimezone(new \DateTimeZone('UTC'));
-                $since = $dt->format('Y-m-d H:i:s');
-            }
-
-            $domain = $since ? [['write_date', '>=', $since]] : [];
-
-            Logger::debug("Filtro original: {$originalSince} | Dominio aplicado: " . json_encode($domain), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
-            ]);
-
-            $fields = ['id', 'default_code', 'name', 'list_price', 'qty_available', 'write_date'];
-            $ids = $this->execute_kw('product.product', 'search', [$domain]);
-
-            Logger::debug("IDs encontrados: " . count($ids), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
-            ]);
-
-            if (empty($ids)) return [];
-
-            $products = $this->execute_kw('product.product', 'read', [$ids, $fields]);
-
-            Logger::debug("Productos leídos: " . count($products), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
-            ]);
-
-            $validProducts = [];
-            foreach ($products as $p) {
-                $writeDate = $p['write_date'] ?? '';
-                $isValid = true;
-
-                if ($since && $writeDate) {
-                    $wd = new \DateTime($writeDate, new \DateTimeZone('UTC'));
-                    $cut = new \DateTime($since, new \DateTimeZone('UTC'));
-                    $isValid = $wd >= $cut;
-
-                    if (!$isValid) {
-                        Logger::debug("Producto fuera de rango | SKU: {$p['default_code']} | write_date: {$writeDate}", [
-                            'flow' => 'odoo',
-                            'requestId' => $this->requestId ?? '-'
-                        ]);
-                    }
-                }
-
-                if ($isValid) {
-                    $validProducts[] = [
-                        'id'            => $p['id'] ?? null,
-                        'default_code'  => $p['default_code'] ?? '',
-                        'name'          => $p['name'] ?? '',
-                        'list_price'    => $p['list_price'] ?? 0,
-                        'qty_available' => $p['qty_available'] ?? 0,
-                        'write_date'    => $writeDate,
-                    ];
-                }
-            }
-
-            Logger::debug("Productos válidos dentro del rango: " . count($validProducts), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
-            ]);
-
-            return $validProducts;
-
-        } catch (\Throwable $e) {
-            Logger::error("fetchProducts error: " . $e->getMessage(), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-'
-            ]);
-            return [];
+            throw new \RuntimeException("Not authenticated. Call authenticate() first.");
         }
-    }
 
-    public function adjustStock(int $productId, float $newQty): array
-    {
+        // Build domain filter
+        $domain = [];
+        if ($since) {
+            $this->logger->debug("[fetchProducts] Applying date filter", [
+                'requestId' => $this->requestId,
+                'since' => $since
+            ]);
+            $domain[] = ['write_date', '>=', $since];
+        }
+
+        $this->logger->debug("[fetchProducts] Domain filter constructed", [
+            'requestId' => $this->requestId,
+            'domain' => json_encode($domain),
+            'domain_count' => count($domain)
+        ]);
+
+        // Step 1: Search for product IDs
+        $this->logger->info("[fetchProducts] Step 1: Searching for product IDs...", [
+            'requestId' => $this->requestId
+        ]);
+
+        // Para search, los parámetros deben ir en un solo array
+        $searchArgs = [$this->buildXmlRpcValue($domain)];
+        
+        // Opciones adicionales en un struct
+        $searchOptions = $this->buildXmlRpcValue([
+            'offset' => 0,
+            'limit' => false,
+            'order' => false
+        ]);
+
+        $this->logger->debug("[fetchProducts] Search params prepared", [
+            'requestId' => $this->requestId,
+            'domain' => json_encode($domain)
+        ]);
+
         try {
-            $domain = [
-                ['product_id', '=', $productId],
-                ['location_id.usage', '=', 'internal']
-            ];
-            $quantIds = $this->execute_kw('stock.quant', 'search', [$domain], ['limit' => 1]);
+            $ids = $this->executeKw('product.product', 'search', $searchArgs);
+            
+            $this->logger->info("[fetchProducts] Search completed", [
+                'requestId' => $this->requestId,
+                'ids_found' => count($ids),
+                'ids' => json_encode($ids),
+                'elapsed_ms' => round((microtime(true) - $startTime) * 1000, 2)
+            ]);
 
-            if (empty($quantIds)) {
-                Logger::error("No se encontró quant para producto", [
-                    'flow' => 'odoo',
-                    'requestId' => $this->requestId ?? '-',
-                    'productId' => $productId
+            if (empty($ids)) {
+                $this->logger->warning("[fetchProducts] No products found matching criteria", [
+                    'requestId' => $this->requestId,
+                    'since' => $since,
+                    'domain' => json_encode($domain),
+                    'suggestion' => 'Verify that products exist in Odoo with write_date >= ' . $since
                 ]);
-                return ['ok' => false, 'error' => 'No quant found for product'];
+                return [];
             }
 
-            $quantId = is_array($quantIds) ? $quantIds[0] : $quantIds;
+        } catch (\Exception $e) {
+            $this->logger->error("[fetchProducts] Search failed", [
+                'requestId' => $this->requestId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw $e;
+        }
 
-            $this->execute_kw('stock.quant', 'write', [[$quantId], ['inventory_quantity' => $newQty]]);
-            $this->execute_kw('stock.quant', 'action_apply_inventory', [[$quantId]]);
+        // Step 2: Read product details
+        $this->logger->info("[fetchProducts] Step 2: Reading product details...", [
+            'requestId' => $this->requestId,
+            'product_count' => count($ids)
+        ]);
 
-            Logger::info("Stock ajustado en Odoo", [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-',
-                'productId' => $productId,
-                'newQty' => $newQty
+        $fields = ['default_code', 'qty_available', 'list_price', 'name', 'write_date'];
+        
+        $this->logger->debug("[fetchProducts] Fields to fetch", [
+            'requestId' => $this->requestId,
+            'fields' => $fields
+        ]);
+
+        $readParams = [
+            $this->buildXmlRpcValue($ids),
+            $this->buildXmlRpcValue($fields)
+        ];
+
+        try {
+            $products = $this->executeKw('product.product', 'read', $readParams);
+            
+            $this->logger->info("[fetchProducts] Products read successfully", [
+                'requestId' => $this->requestId,
+                'products_read' => count($products),
+                'elapsed_ms' => round((microtime(true) - $startTime) * 1000, 2)
             ]);
 
-            return ['ok' => true, 'quant_id' => $quantId, 'newQty' => $newQty];
-        } catch (\Throwable $e) {
-            Logger::error("adjustStock error: " . $e->getMessage(), [
-                'flow' => 'odoo',
-                'requestId' => $this->requestId ?? '-',
-                'productId' => $productId,
-                'newQty' => $newQty
+        } catch (\Exception $e) {
+            $this->logger->error("[fetchProducts] Read failed", [
+                'requestId' => $this->requestId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
             ]);
-            return ['ok' => false, 'error' => $e->getMessage()];
+            throw $e;
+        }
+
+        // Step 3: Transform to output format
+        $this->logger->info("[fetchProducts] Step 3: Transforming results...", [
+            'requestId' => $this->requestId
+        ]);
+
+        $items = [];
+        $skippedCount = 0;
+
+        foreach ($products as $product) {
+            $sku = $product['default_code'] ?? null;
+            
+            if (empty($sku)) {
+                $skippedCount++;
+                $this->logger->debug("[fetchProducts] Skipping product without SKU", [
+                    'requestId' => $this->requestId,
+                    'product_id' => $product['id'] ?? 'unknown',
+                    'product_name' => $product['name'] ?? 'unknown'
+                ]);
+                continue;
+            }
+
+            $item = [
+                'sku' => $sku,
+                'quantity' => (int)($product['qty_available'] ?? 0),
+                'price' => (float)($product['list_price'] ?? 0.0),
+                'name' => $product['name'] ?? '',
+                'write_date' => $product['write_date'] ?? ''
+            ];
+
+            $items[] = $item;
+
+            $this->logger->debug("[fetchProducts] Product added", [
+                'requestId' => $this->requestId,
+                'sku' => $sku,
+                'quantity' => $item['quantity'],
+                'price' => $item['price']
+            ]);
+        }
+
+        $totalTime = round((microtime(true) - $startTime) * 1000, 2);
+
+        $this->logger->info("[fetchProducts] === FINALIZACIÓN EXITOSA ===", [
+            'requestId' => $this->requestId,
+            'total_products' => count($items),
+            'skipped_products' => $skippedCount,
+            'total_time_ms' => $totalTime,
+            'avg_time_per_product_ms' => count($items) > 0 ? round($totalTime / count($items), 2) : 0
+        ]);
+
+        return $items;
+    }
+
+    /**
+     * Execute Odoo model method via XML-RPC
+     */
+    private function executeKw(string $model, string $method, array $args = []): mixed
+    {
+        $this->logger->debug("[executeKw] Calling Odoo method", [
+            'requestId' => $this->requestId,
+            'model' => $model,
+            'method' => $method,
+            'args_count' => count($args)
+        ]);
+
+        $client = new XmlRpcClient($this->url . '/xmlrpc/2/object');
+        $client->setSSLVerifyPeer(false);
+        $client->setSSLVerifyHost(0);
+
+        $xmlrpcParams = [
+            new Value($this->db, 'string'),
+            new Value($this->uid, 'int'),
+            new Value($this->password, 'string'),
+            new Value($model, 'string'),
+            new Value($method, 'string'),
+            new Value($args, 'array')  // Los args van como UN SOLO array
+        ];
+
+        $msg = new XmlRpcRequest('execute_kw', $xmlrpcParams);
+        $response = $client->send($msg);
+
+        if ($response->faultCode()) {
+            $error = "execute_kw failed: " . $response->faultString();
+            $this->logger->error("[executeKw] $error", [
+                'requestId' => $this->requestId,
+                'model' => $model,
+                'method' => $method
+            ]);
+            throw new \RuntimeException($error);
+        }
+
+        $result = $this->phpize($response->value());
+
+        $this->logger->debug("[executeKw] Method executed successfully", [
+            'requestId' => $this->requestId,
+            'model' => $model,
+            'method' => $method,
+            'result_type' => gettype($result),
+            'result_count' => is_array($result) ? count($result) : 'N/A'
+        ]);
+
+        return $result;
+    }
+
+    /**
+     * Convert PHP values to XML-RPC Value objects
+     */
+    private function buildXmlRpcValue(mixed $value): Value
+    {
+        if (is_array($value)) {
+            // IMPORTANTE: Arrays vacíos SIEMPRE son arrays, nunca structs
+            if (empty($value)) {
+                return new Value([], 'array');
+            }
+            
+            if (array_keys($value) === range(0, count($value) - 1)) {
+                // Indexed array
+                $items = array_map(fn($v) => $this->buildXmlRpcValue($v), $value);
+                return new Value($items, 'array');
+            } else {
+                // Associative array
+                $items = [];
+                foreach ($value as $k => $v) {
+                    $items[$k] = $this->buildXmlRpcValue($v);
+                }
+                return new Value($items, 'struct');
+            }
+        } elseif (is_int($value)) {
+            return new Value($value, 'int');
+        } elseif (is_float($value)) {
+            return new Value($value, 'double');
+        } elseif (is_bool($value)) {
+            return new Value($value, 'boolean');
+        } elseif ($value === false || $value === null) {
+            return new Value(false, 'boolean');
+        } else {
+            return new Value((string)$value, 'string');
         }
     }
 
-    private function wrapParam(mixed $param): Value
+    /**
+     * Convert XML-RPC Value to PHP native types
+     */
+    private function phpize(Value $value): mixed
     {
-        if ($param instanceof Value) return $param;
-        return $this->buildXmlRpcValue($param);
+        $type = $value->scalartyp();
+
+        if ($type === 'array') {
+            $result = [];
+            foreach ($value as $item) {
+                $result[] = $this->phpize($item);
+            }
+            return $result;
+        } elseif ($type === 'struct') {
+            $result = [];
+            foreach ($value as $key => $item) {
+                $result[$key] = $this->phpize($item);
+            }
+            return $result;
+        } else {
+            return $value->scalarval();
+        }
+    }
+
+    public function getRequestId(): string
+    {
+        return $this->requestId;
     }
 }
