@@ -113,15 +113,7 @@ class OdooClient
             'requestId' => $this->requestId
         ]);
 
-        // Para search, los parámetros deben ir en un solo array
         $searchArgs = [$this->buildXmlRpcValue($domain)];
-        
-        // Opciones adicionales en un struct
-        $searchOptions = $this->buildXmlRpcValue([
-            'offset' => 0,
-            'limit' => false,
-            'order' => false
-        ]);
 
         $this->logger->debug("[fetchProducts] Search params prepared", [
             'requestId' => $this->requestId,
@@ -163,7 +155,7 @@ class OdooClient
             'product_count' => count($ids)
         ]);
 
-        $fields = ['default_code', 'qty_available', 'list_price', 'name', 'write_date'];
+        $fields = ['id', 'default_code', 'qty_available', 'list_price', 'name', 'write_date'];
         
         $this->logger->debug("[fetchProducts] Fields to fetch", [
             'requestId' => $this->requestId,
@@ -215,6 +207,7 @@ class OdooClient
             }
 
             $item = [
+                'id' => (int)($product['id'] ?? 0),
                 'sku' => $sku,
                 'quantity' => (int)($product['qty_available'] ?? 0),
                 'price' => (float)($product['list_price'] ?? 0.0),
@@ -226,6 +219,7 @@ class OdooClient
 
             $this->logger->debug("[fetchProducts] Product added", [
                 'requestId' => $this->requestId,
+                'odoo_id' => $item['id'],
                 'sku' => $sku,
                 'quantity' => $item['quantity'],
                 'price' => $item['price']
@@ -243,6 +237,119 @@ class OdooClient
         ]);
 
         return $items;
+    }
+
+    /**
+     * Adjust stock quantity for a product in Odoo
+     * 
+     * @param int $productId Product ID in Odoo
+     * @param float $newQuantity New quantity to set
+     * @param int|null $locationId Location ID (default: first internal location found)
+     * @return array Result with 'ok' status
+     */
+    public function adjustStock(int $productId, float $newQuantity, ?int $locationId = null): array
+    {
+        $this->logger->info("[adjustStock] Starting stock adjustment", [
+            'requestId' => $this->requestId,
+            'product_id' => $productId,
+            'new_quantity' => $newQuantity
+        ]);
+
+        if (!$this->uid) {
+            $this->logger->error("[adjustStock] Not authenticated", [
+                'requestId' => $this->requestId
+            ]);
+            throw new \RuntimeException("Not authenticated. Call authenticate() first.");
+        }
+
+        // Si no se especifica location, buscar el location de stock principal
+        if ($locationId === null) {
+            try {
+                // Buscar location "Stock" (internal location)
+                $searchArgs = [
+                    $this->buildXmlRpcValue([['usage', '=', 'internal']])
+                ];
+                $locationIds = $this->executeKw('stock.location', 'search', $searchArgs);
+                
+                if (empty($locationIds)) {
+                    $this->logger->error("[adjustStock] No stock location found", [
+                        'requestId' => $this->requestId
+                    ]);
+                    return ['ok' => false, 'reason' => 'no_location'];
+                }
+                
+                $locationId = $locationIds[0];
+                $this->logger->debug("[adjustStock] Using location", [
+                    'requestId' => $this->requestId,
+                    'location_id' => $locationId
+                ]);
+            } catch (\Exception $e) {
+                $this->logger->error("[adjustStock] Error finding location: " . $e->getMessage(), [
+                    'requestId' => $this->requestId
+                ]);
+                return ['ok' => false, 'reason' => 'location_error', 'message' => $e->getMessage()];
+            }
+        }
+
+        try {
+            // Buscar el stock.quant existente para este producto y location
+            $searchArgs = [
+                $this->buildXmlRpcValue([
+                    ['product_id', '=', $productId],
+                    ['location_id', '=', $locationId]
+                ])
+            ];
+            
+            $quantIds = $this->executeKw('stock.quant', 'search', $searchArgs);
+            
+            if (!empty($quantIds)) {
+                // Actualizar quant existente
+                $quantId = $quantIds[0];
+                
+                $writeArgs = [
+                    $this->buildXmlRpcValue([$quantId]),
+                    $this->buildXmlRpcValue(['quantity' => $newQuantity])
+                ];
+                
+                $this->executeKw('stock.quant', 'write', $writeArgs);
+                
+                $this->logger->info("[adjustStock] Stock updated successfully", [
+                    'requestId' => $this->requestId,
+                    'product_id' => $productId,
+                    'quant_id' => $quantId,
+                    'new_quantity' => $newQuantity
+                ]);
+                
+                return ['ok' => true, 'quant_id' => $quantId, 'quantity' => $newQuantity];
+            } else {
+                // Crear nuevo quant
+                $createArgs = [
+                    $this->buildXmlRpcValue([
+                        'product_id' => $productId,
+                        'location_id' => $locationId,
+                        'quantity' => $newQuantity
+                    ])
+                ];
+                
+                $quantId = $this->executeKw('stock.quant', 'create', $createArgs);
+                
+                $this->logger->info("[adjustStock] New stock quant created", [
+                    'requestId' => $this->requestId,
+                    'product_id' => $productId,
+                    'quant_id' => $quantId,
+                    'new_quantity' => $newQuantity
+                ]);
+                
+                return ['ok' => true, 'quant_id' => $quantId, 'quantity' => $newQuantity];
+            }
+        } catch (\Exception $e) {
+            $this->logger->error("[adjustStock] Error adjusting stock: " . $e->getMessage(), [
+                'requestId' => $this->requestId,
+                'product_id' => $productId,
+                'trace' => $e->getTraceAsString()
+            ]);
+            return ['ok' => false, 'reason' => 'adjustment_error', 'message' => $e->getMessage()];
+        }
     }
 
     /**
@@ -267,7 +374,7 @@ class OdooClient
             new Value($this->password, 'string'),
             new Value($model, 'string'),
             new Value($method, 'string'),
-            new Value($args, 'array')  // Los args van como UN SOLO array
+            new Value($args, 'array')
         ];
 
         $msg = new XmlRpcRequest('execute_kw', $xmlrpcParams);

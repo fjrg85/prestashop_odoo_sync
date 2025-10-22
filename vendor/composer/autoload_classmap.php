@@ -21,6 +21,7 @@ return array(
     'App\\Utils\\CronLock' => $baseDir . '/app/Utils/CronLock.php',
     'App\\Utils\\CsvWriter' => $baseDir . '/app/Utils/CsvWriter.php',
     'App\\Utils\\Logger' => $baseDir . '/app/Utils/Logger.php',
+    'App\\Utils\\LoggerAdapter' => $baseDir . '/app/Utils/LoggerAdapter.php',
     'App\\Utils\\Mode' => $baseDir . '/app/Utils/Mode.php',
     'App\\Utils\\RequestId' => $baseDir . '/app/Utils/RequestId.php',
     'Attribute' => $vendorDir . '/symfony/polyfill-php80/Resources/stubs/Attribute.php',

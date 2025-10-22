@@ -131,6 +131,7 @@ class ComposerStaticInitf8036e357d71498301c1c9c554a47f34
         'App\\Utils\\CronLock' => __DIR__ . '/../..' . '/app/Utils/CronLock.php',
         'App\\Utils\\CsvWriter' => __DIR__ . '/../..' . '/app/Utils/CsvWriter.php',
         'App\\Utils\\Logger' => __DIR__ . '/../..' . '/app/Utils/Logger.php',
+        'App\\Utils\\LoggerAdapter' => __DIR__ . '/../..' . '/app/Utils/LoggerAdapter.php',
         'App\\Utils\\Mode' => __DIR__ . '/../..' . '/app/Utils/Mode.php',
         'App\\Utils\\RequestId' => __DIR__ . '/../..' . '/app/Utils/RequestId.php',
         'Attribute' => __DIR__ . '/..' . '/symfony/polyfill-php80/Resources/stubs/Attribute.php',

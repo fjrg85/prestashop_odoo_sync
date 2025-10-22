@@ -14,7 +14,7 @@ class PrestaClientAdapter
         'list_price' => 'price',
     ];
 
-    private OdooClient $odoo;
+    private ?OdooClient $odoo = null;
 
     public function __construct(
         private PrestaClient $client,
@@ -25,7 +25,7 @@ class PrestaClientAdapter
         if ($this->resolver === null) {
             $this->resolver = new SkuResolver(Config::get('PRESTA_URL'), Config::get('PRESTA_KEY'));
         }
-        $this->odoo = $odoo ?? new OdooClient();
+        $this->odoo = $odoo;
     }
 
     /**
@@ -144,11 +144,19 @@ class PrestaClientAdapter
             'flow'=>$flow,'requestId'=>$this->requestId,'sku'=>$skuNorm,'soldQty'=>$soldQty
         ]);
 
+        // Validar que odoo esté disponible
+        if ($this->odoo === null) {
+            Logger::error("OdooClient no disponible para syncSaleToOdoo", [
+                'flow'=>$flow,'requestId'=>$this->requestId,'sku'=>$skuNorm
+            ]);
+            return ['ok'=>false, 'reason'=>'odoo_not_configured'];
+        }
+
         // 1. Buscar producto en Odoo
         $products = $this->odoo->fetchProducts();
         $product = null;
         foreach ($products as $p) {
-            if (mb_strtoupper($p['default_code']) === $skuNorm) {
+            if (mb_strtoupper($p['sku'] ?? '') === $skuNorm) {
                 $product = $p;
                 break;
             }
@@ -162,7 +170,7 @@ class PrestaClientAdapter
         }
 
         // 2. Calcular nuevo stock
-        $currentQty = (float)($product['qty_available'] ?? 0);
+        $currentQty = (float)($product['quantity'] ?? 0);
         $newQty = max(0, $currentQty - $soldQty);
 
         // 3. Ajustar stock en Odoo

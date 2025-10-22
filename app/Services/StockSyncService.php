@@ -8,6 +8,7 @@ use App\Clients\OdooClient;
 use App\Utils\CsvWriter;
 use App\Utils\Logger;
 use App\Utils\Config;
+use App\Utils\LoggerAdapter;
 
 class StockSyncService
 {
@@ -29,10 +30,13 @@ class StockSyncService
             Config::get('ODOO_BASE_URL'),
             Config::get('ODOO_DB'),
             Config::get('ODOO_USER'),
-            Config::get('ODOO_PASS')
+            Config::get('ODOO_PASS'),
+            new LoggerAdapter(['flow' => 'stock', 'requestId' => $this->requestId]),
+            $this->requestId // ← para trazabilidad
         );
-        $odoo->setRequestId($this->requestId);
 
+        $odoo->authenticate();
+        
         // Construir lista de items
         $items = [];
         if (!empty($context['webhook_payload']) && is_array($context['webhook_payload'])) {
@@ -53,9 +57,9 @@ class StockSyncService
             $products = $odoo->fetchProducts($context['since'] ?? null);
             foreach ($products as $p) {
                 $items[] = [
-                    'sku'      => $p['default_code'] ?? '',
-                    'quantity' => (int)($p['qty_available'] ?? 0),
-                    'price'    => (float)($p['list_price'] ?? 0)
+                    'sku'      => $p['sku'] ?? '',           // ✅ Cambiar a 'sku'
+                    'quantity' => (int)($p['quantity'] ?? 0), // ✅ Cambiar a 'quantity'
+                    'price'    => (float)($p['price'] ?? 0)   // ✅ Cambiar a 'price'
                 ];
             }
 
